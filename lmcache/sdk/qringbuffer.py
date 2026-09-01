@@ -15,6 +15,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.gpu_connector.utils import get_device
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocol import RequestType
 
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     # First Party
-    from lmcache.integration.vllm.lmcache_mp_connector import (
+    from lmcache.integration.vllm.lmcache_mp_metadata import (
         LMCacheMPConnectorMetadata,
     )
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
@@ -289,7 +290,7 @@ class QRingBufferCapture:
             if isinstance(raw_dtype, torch.dtype)
             else getattr(torch, str(raw_dtype))
         )
-        device = next(iter(kv_caches.values())).device
+        device = get_device(next(iter(kv_caches.values())))
         block_size = vllm_config.cache_config.block_size
 
         cfg = vllm_config.kv_transfer_config
