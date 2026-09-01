@@ -1,0 +1,101 @@
+{
+  "sha": "2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+  "node_id": "C_kwDOKBKCAtoAKDJlMDA3MzFmOGQwYmZmMjNkYzQzMjUxNjEwNDRkMGVkOGFmOTRjMWU",
+  "commit": {
+    "author": {
+      "name": "Yushi Bai",
+      "email": "48798083+bys0318@users.noreply.github.com",
+      "date": "2025-01-15T02:04:04Z"
+    },
+    "committer": {
+      "name": "GitHub",
+      "email": "noreply@github.com",
+      "date": "2025-01-15T02:04:04Z"
+    },
+    "message": "Update README.md",
+    "tree": {
+      "sha": "2089bb180ad9cb9202ec05ea08a711d48147010b",
+      "url": "https://api.github.com/repos/THUDM/LongBench/git/trees/2089bb180ad9cb9202ec05ea08a711d48147010b"
+    },
+    "url": "https://api.github.com/repos/THUDM/LongBench/git/commits/2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+    "comment_count": 0,
+    "verification": {
+      "verified": true,
+      "reason": "valid",
+      "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJnhxeUCRC1aQ7uu5UhlAAA6CAQAJfJvbt/bLGgrKnbqt8qiCuj\nCs6t19+LKyyRpMRCnpYuQ4aa+/vnlIVaka4pSyRSoxh4OzqkSMniAv82Tr+ubQKU\nr9l1mPS7C8AqTquWe9TfzDa9Mkp0bFlTvbEPh4j8aitSw3VKIGmaYV//q0LZOMZ1\nYO+iIymegJZhmWhc+uf61w2ieTpomhJweT5D2Wu3wZuwnNgkBsS4u9cO4Mv3pIa3\n6c7ojiS9ShfCPxNY27HsZ4IeqaNhHgwqAT2kPt7LhgM+3LLq0JGcIADymK+sEyue\nTM1j1iZhm74t3+0u/4gL+7u3LnVtXbTkbJemQj9NLWkIzxYK2K8q1Pi4y9QtK1TZ\nwmAvz+Gc5d7nOoZgVoOVNHSsYxs9d3+zX3evr3bHNV3PVfMbZkzMvOg/hvkuwGHt\ngaHUlenaj0wlRYVbLL3UCOc0w36So3mKjsh+ranpuycNDn7OmfgDfsMSZVJvPG1Y\nCO9kZDDexdeCCfSkZTpX7ItPtMuBgUdrxFu2AlsIpVypNrNkzu+PCK0QlwdKPiUo\nm8iwQ/OpDbItsI2T8vriplji1oYRhy+7Z3C+DxA1zA9KLbkbH41KadDYnZ8cJwGA\nleKnuyL6kGka8MB++gh4ZHGZRuIx8wquAmL1JSjVv+LioJ3RpvOQF54UqQEm/WIX\nxKQZ47QxRbFOztAV05AO\n=4DUG\n-----END PGP SIGNATURE-----\n",
+      "payload": "tree 2089bb180ad9cb9202ec05ea08a711d48147010b\nparent e22ca9ffb36474e64d32d3b9f0a5670548969e6c\nauthor Yushi Bai <48798083+bys0318@users.noreply.github.com> 1736906644 +0800\ncommitter GitHub <noreply@github.com> 1736906644 +0800\n\nUpdate README.md",
+      "verified_at": "2025-01-15T02:09:07Z"
+    }
+  },
+  "url": "https://api.github.com/repos/THUDM/LongBench/commits/2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+  "html_url": "https://github.com/THUDM/LongBench/commit/2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+  "comments_url": "https://api.github.com/repos/THUDM/LongBench/commits/2e00731f8d0bff23dc4325161044d0ed8af94c1e/comments",
+  "author": {
+    "login": "bys0318",
+    "id": 48798083,
+    "node_id": "MDQ6VXNlcjQ4Nzk4MDgz",
+    "avatar_url": "https://avatars.githubusercontent.com/u/48798083?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/bys0318",
+    "html_url": "https://github.com/bys0318",
+    "followers_url": "https://api.github.com/users/bys0318/followers",
+    "following_url": "https://api.github.com/users/bys0318/following{/other_user}",
+    "gists_url": "https://api.github.com/users/bys0318/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/bys0318/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/bys0318/subscriptions",
+    "organizations_url": "https://api.github.com/users/bys0318/orgs",
+    "repos_url": "https://api.github.com/users/bys0318/repos",
+    "events_url": "https://api.github.com/users/bys0318/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/bys0318/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "committer": {
+    "login": "web-flow",
+    "id": 19864447,
+    "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
+    "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/web-flow",
+    "html_url": "https://github.com/web-flow",
+    "followers_url": "https://api.github.com/users/web-flow/followers",
+    "following_url": "https://api.github.com/users/web-flow/following{/other_user}",
+    "gists_url": "https://api.github.com/users/web-flow/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/web-flow/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/web-flow/subscriptions",
+    "organizations_url": "https://api.github.com/users/web-flow/orgs",
+    "repos_url": "https://api.github.com/users/web-flow/repos",
+    "events_url": "https://api.github.com/users/web-flow/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/web-flow/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "parents": [
+    {
+      "sha": "e22ca9ffb36474e64d32d3b9f0a5670548969e6c",
+      "url": "https://api.github.com/repos/THUDM/LongBench/commits/e22ca9ffb36474e64d32d3b9f0a5670548969e6c",
+      "html_url": "https://github.com/THUDM/LongBench/commit/e22ca9ffb36474e64d32d3b9f0a5670548969e6c"
+    }
+  ],
+  "stats": {
+    "total": 2,
+    "additions": 2,
+    "deletions": 0
+  },
+  "files": [
+    {
+      "sha": "6dea533c806940f071db3b49e1938f79ab08f837",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/THUDM/LongBench/blob/2e00731f8d0bff23dc4325161044d0ed8af94c1e/README.md",
+      "raw_url": "https://github.com/THUDM/LongBench/raw/2e00731f8d0bff23dc4325161044d0ed8af94c1e/README.md",
+      "contents_url": "https://api.github.com/repos/THUDM/LongBench/contents/README.md?ref=2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+      "patch": "@@ -24,6 +24,8 @@ To elaborate, LongBench v2 consists of 503 challenging multiple-choice questions\n </div>\n \n ## 🔥 Updates\n+🔥🔥🔥 **[2024/01/15]** More evaluation results added to our [leaderboard](https://longbench2.github.io/#leaderboard), including Gemini-Exp-1206, Gemini-2.0-Flash, DeepSeek-V3, and MiniMax-Text-01, Check them out!\n+\n 🔥🔥🔥 **[2024/12/20]** We are excited to release **LongBench v2**! Compared to the first generation of LongBench, LongBench v2 is much longer and much more challenging. Its goal is to provide a reliable evaluation standard for the development of future superhuman long-context AI systems.\n \n ## ⚙️ How to evaluate on LongBench v2"
+    }
+  ]
+}

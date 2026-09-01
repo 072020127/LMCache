@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "cachegen_kernels.cuh"
 
 #define MAX_LP 48
@@ -416,6 +417,7 @@ void encode_cuda_new(const at::Tensor& cdf, const at::Tensor& input_sym,
 
   dim3 block_dim(block_size, 1, 1);
   dim3 grid_dim(nlayers, nchannels / block_size, 1);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   // TODO: potential optimization: use PackedAccessor32 to access the tensors,
   // in case the tensor is not contiguous
@@ -430,8 +432,8 @@ void encode_cuda_new(const at::Tensor& cdf, const at::Tensor& input_sym,
 
   /* Call the kernel */
 #ifndef LAUNCH_ENCODE_KERNEL
-  #define LAUNCH_ENCODE_KERNEL(block_size)                            \
-    encode_with_accessor_kernel<block_size><<<grid_dim, block_dim>>>( \
+  #define LAUNCH_ENCODE_KERNEL(block_size)                                  \
+    encode_with_accessor_kernel<block_size><<<grid_dim, block_dim, 0, stream>>>( \
         cdf_accessor, input_sym_accessor, output_buffer_accessor,     \
         output_lengths_accessor, cdf_shape[2], ntokens)
 //#define LAUNCH_ENCODE_KERNEL(block_size) \

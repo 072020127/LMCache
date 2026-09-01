@@ -1,0 +1,5 @@
+# Dependencies used by the vendored official LongBench evaluator.
+numpy<=2.2.6
+jieba==0.42.1
+fuzzywuzzy==0.18.0
+rouge==1.0.1

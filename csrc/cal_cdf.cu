@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/torch.h>
 #include <ATen/ATen.h>
 
@@ -89,11 +90,12 @@ at::Tensor calculate_cdf(const at::Tensor& input, const int max_bins) {
   int block_size = get_block_size(nchannels);
   dim3 block_dim(block_size, 1, 1);
   dim3 grid_dim(nchannels / block_size, nlayers, 1);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 #ifndef LAUNCH_CDF_KERNEL
   #define LAUNCH_CDF_KERNEL(block_size)                                      \
-    calculate_cdf_kernel<block_size, MAX_BINS_SUPPORTED>                     \
-        <<<grid_dim, block_dim>>>(input_accessor, output_accessor, max_bins, \
+    calculate_cdf_kernel<block_size, MAX_BINS_SUPPORTED>                          \
+        <<<grid_dim, block_dim, 0, stream>>>(input_accessor, output_accessor, max_bins, \
                                   ntokens)
 #endif
   switch (block_size) {

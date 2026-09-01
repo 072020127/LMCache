@@ -705,6 +705,14 @@ def _validate_config(self):
         raise ValueError(
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
         )
+    # Keep the native serde modes independent from the optional MaKV stack.
+    # MaKV-specific validation is only relevant when that mode is selected.
+    if self.remote_serde == "makv":
+        from lmcache.v1.storage_backend.makv.config import (
+            validate_makv_runtime_config,
+        )
+
+        validate_makv_runtime_config(self)
 
     if self.enable_blending:
         if not self.save_unfull_chunk:

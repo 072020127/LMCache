@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
@@ -45,6 +45,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.storage_backend.makv.runtime_risk import RuntimeRiskDispatcher
 
 if TYPE_CHECKING:
     # Third Party
@@ -278,6 +279,8 @@ class RequestTracker:
 class ReqMeta:
     # Request id
     req_id: str
+    # Original request prompt length before full-chunk alignment.
+    prompt_len: int
     # Request tokens
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
@@ -426,6 +429,7 @@ class ReqMeta:
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         return ReqMeta(
             req_id=tracker.req_id,
+            prompt_len=tracker.prompt_len,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             is_last_prefill=is_last_prefill,
@@ -594,6 +598,28 @@ class LMCacheConnectorV1Impl:
             )
         )
         self._invalid_block_ids: set[int] = set()
+        self._runtime_risk_dispatcher: RuntimeRiskDispatcher | None = None
+        if (
+            role != KVConnectorRole.SCHEDULER
+            and config.remote_serde == "makv"
+            and config.get_extra_config_value("makv_real_risk_enabled", False)
+        ):
+            queue_depth = int(
+                config.get_extra_config_value("makv_real_risk_queue_depth", 128)
+            )
+            window_tokens = int(
+                config.get_extra_config_value("makv_risk_window_tokens", 16)
+            )
+            self._runtime_risk_dispatcher = RuntimeRiskDispatcher(
+                self._send_runtime_risk,
+                max_queue=queue_depth,
+                window_tokens=window_tokens,
+            )
+            logger.info(
+                "Enabled opt-in MaKV runtime risk observer: queue=%d window=%d",
+                queue_depth,
+                window_tokens,
+            )
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -1231,6 +1257,7 @@ class LMCacheConnectorV1Impl:
                 offset=skip_leading_tokens,
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
+                request_token_count=request.prompt_len,
                 req_id=request.req_id,
             )
 
@@ -1345,10 +1372,99 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids.clear()
         return invalid_blocks
 
+    def submit_precision_risk(
+        self,
+        request_id: str,
+        logits: torch.Tensor,
+        step: int,
+        token_index: int,
+        prompt_token_ids: Sequence[int],
+        request_params: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Queue a real decode-logit risk signal for one absolute KV token.
+
+        This worker-side API is deliberately inert unless the MaKV runtime
+        observer is explicitly enabled.  ``token_index`` must be supplied by
+        the request context; the method never derives it from ``step``.
+        """
+        dispatcher = self._runtime_risk_dispatcher
+        if dispatcher is None:
+            logger.warning("MaKV runtime risk dispatcher is unavailable")
+            return False
+        if self.lmcache_engine is None:
+            logger.warning("MaKV runtime risk LMCache engine is unavailable")
+            return False
+        tracker = self._request_trackers.get(request_id)
+        if tracker is not None:
+            if len(prompt_token_ids) != tracker.prompt_len:
+                logger.warning(
+                    "MaKV runtime risk prompt length mismatch for %s: "
+                    "observed=%d tracker=%d",
+                    request_id,
+                    len(prompt_token_ids),
+                    tracker.prompt_len,
+                )
+                return False
+            prompt_tokens = tracker.token_ids[: tracker.prompt_len]
+            if len(prompt_tokens) != tracker.prompt_len:
+                logger.warning(
+                    "MaKV runtime risk tracker token length mismatch for %s: "
+                    "observed=%d expected=%d",
+                    request_id,
+                    len(prompt_tokens),
+                    tracker.prompt_len,
+                )
+                return False
+            request_configs = tracker.request_configs
+        else:
+            prompt_tokens = list(prompt_token_ids)
+            request_configs = {
+                key: value
+                for key, value in (request_params or {}).items()
+                if key.startswith("lmcache.")
+            }
+        accepted = dispatcher.submit(
+            request_id,
+            prompt_tokens,
+            token_index,
+            logits,
+            step=step,
+            request_configs=request_configs,
+        )
+        if not accepted:
+            logger.warning(
+                "MaKV runtime risk observation dropped for request %s at "
+                "token %d: %s",
+                request_id,
+                token_index,
+                dispatcher.stats(),
+            )
+        return accepted
+
+    def _send_runtime_risk(
+        self,
+        request_id: str,
+        prompt_token_ids: Sequence[int],
+        token_index: int,
+        signal: Any,
+        request_configs: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        if self.lmcache_engine is None:
+            return {"accepted": False, "reason": "engine_unavailable"}
+        del request_id
+        return self.lmcache_engine.report_precision_risk(
+            list(prompt_token_ids),
+            token_index,
+            signal.as_dict(),
+            request_configs=None if request_configs is None else dict(request_configs),
+        )
+
     @_lmcache_nvtx_annotate
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        if self._runtime_risk_dispatcher is not None:
+            self._runtime_risk_dispatcher.close(wait=True)
         self._manager.stop_services()
 
     ###################
@@ -1440,6 +1556,36 @@ class LMCacheConnectorV1Impl:
                 num_computed_tokens,
             )
             return None
+
+        if (
+            self.kv_role != "kv_consumer"
+            and self.config.remote_serde == "makv"
+        ):
+            try:
+                # The scheduler owns the complete prompt and starts ScoutRank
+                # before vLLM prefill. The worker later joins this req_id at
+                # LMCacheEngine.store after its existing GPU-to-CPU KV copy.
+                from lmcache.v1.storage_backend.makv.scout_overlap import (
+                    submit_scout_if_needed,
+                )
+
+                submit_scout_if_needed(
+                    self.config,
+                    request_id=req_id,
+                    token_ids=request.prompt_token_ids,
+                    request_configs=extract_request_configs(
+                        request.sampling_params
+                    ),
+                    cached_tokens=num_external_hit_tokens,
+                )
+            except Exception as error:
+                # Cache storage is auxiliary to model execution. Existing MaKV
+                # fallback policy handles a missing score at serialization.
+                logger.warning(
+                    "Reqid %s: failed to submit overlapped ScoutRank job: %s",
+                    req_id,
+                    error,
+                )
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
@@ -1923,15 +2069,19 @@ class LMCacheConnectorV1Impl:
                 "first_tok": request._output_token_ids[0],
             }
 
-        if self.config.get_extra_config_value(
-            "enable_cache_usage_details_in_response", False
-        ):
-            request_tracker = self._request_trackers.get(request.request_id)
-            if request_tracker:
+        request_tracker = self._request_trackers.get(request.request_id)
+        if request_tracker:
+            cached_tokens = request_tracker.num_lmcache_cached_tokens
+            if params is not None and "cached_token_stats" in params:
                 return_params = return_params or {}
-                return_params["num_lmcache_cached_tokens"] = (
-                    request_tracker.num_lmcache_cached_tokens
-                )
+                return_params["cached_token_stats"] = {
+                    "num_lmcache_cached_tokens": cached_tokens,
+                }
+            if self.config.get_extra_config_value(
+                "enable_cache_usage_details_in_response", False
+            ):
+                return_params = return_params or {}
+                return_params["num_lmcache_cached_tokens"] = cached_tokens
 
         return False, return_params
 

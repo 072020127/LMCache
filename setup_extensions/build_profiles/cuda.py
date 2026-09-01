@@ -9,6 +9,7 @@ kernels, Cascade-AC encode/decode, position kernels, and event recorders.
 from typing import TYPE_CHECKING, Optional
 import os
 import shutil
+from pathlib import Path
 
 if TYPE_CHECKING:
     # Third Party
@@ -34,7 +35,19 @@ class CudaProfile(BuildProfile):
         on headless CI build hosts that nevertheless ship a full CUDA
         toolchain.
         """
-        return shutil.which("nvcc") is not None
+        if shutil.which("nvcc") is not None:
+            return True
+
+        # ``nvcc`` is commonly installed under /usr/local/cuda* without its
+        # bin directory being exported in non-interactive build environments.
+        # Probe explicit CUDA_HOME first, then the standard installation roots.
+        roots = [
+            os.environ.get("CUDA_HOME", ""),
+            os.environ.get("CUDA_PATH", ""),
+            "/usr/local/cuda",
+        ]
+        roots.extend(str(path) for path in Path("/usr/local").glob("cuda-*"))
+        return any((Path(root) / "bin" / "nvcc").is_file() for root in roots if root)
 
     def build(self) -> tuple[list["Extension"], dict]:
         """Build CUDA extensions (kernels, allocator, recorders)."""
@@ -60,6 +73,9 @@ class CudaProfile(BuildProfile):
             "csrc/utils.cpp",
             "csrc/event_recorder.cpp",
             "csrc/completion_recorder.cpp",
+            "csrc/makv_ops.cpp",
+            "csrc/dequantize_scatter_cuda.cu",
+            "csrc/makv_paged_cuda.cu",
         ]
         ext_modules = [
             cpp_extension.CUDAExtension(

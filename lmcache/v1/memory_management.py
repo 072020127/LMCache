@@ -964,7 +964,8 @@ class BytesBufferMemoryObj(MemoryObj):
         return [self.get_shape()]
 
     def get_dtypes(self) -> list[torch.dtype]:
-        return []
+        # BINARY_BUFFER is one protocol group; None has a stable dtype id.
+        return [None]  # type: ignore[list-item]
 
     def get_memory_format(self) -> MemoryFormat:
         return self.metadata.fmt

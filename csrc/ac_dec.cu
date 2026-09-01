@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "cachegen_kernels.cuh"
 
 #define MAX_LP 64
@@ -397,6 +398,7 @@ void decode_cuda_new(const at::Tensor& cdf, const at::Tensor& bytestreams,
 
   dim3 block_dim(block_size, 1, 1);
   dim3 grid_dim(nlayers, nchannels / block_size, 1);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   auto cdf_accessor =
       cdf.packed_accessor32<int16_t, 3, torch::RestrictPtrTraits>();
@@ -408,8 +410,8 @@ void decode_cuda_new(const at::Tensor& cdf, const at::Tensor& bytestreams,
       output.packed_accessor32<uint8_t, 3, torch::RestrictPtrTraits>();
 
 #ifndef LAUNCH_DECODE_KERNEL
-  #define LAUNCH_DECODE_KERNEL(block_size)                                     \
-    decode_with_accessor_kernel<block_size><<<grid_dim, block_dim>>>(          \
+  #define LAUNCH_DECODE_KERNEL(block_size)                                         \
+    decode_with_accessor_kernel<block_size><<<grid_dim, block_dim, 0, stream>>>( \
         cdf_accessor, bytestreams_accessor, lengths_accessor, output_accessor, \
         lp, ntokens)
 #endif
@@ -490,6 +492,7 @@ void decode_cuda_prefsum(const at::Tensor& cdf, const at::Tensor& bytestreams,
 
   dim3 block_dim(block_size, 1, 1);
   dim3 grid_dim(nlayers, nchannels / block_size, 1);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   auto cdf_accessor =
       cdf.packed_accessor32<int16_t, 3, torch::RestrictPtrTraits>();
@@ -501,8 +504,8 @@ void decode_cuda_prefsum(const at::Tensor& cdf, const at::Tensor& bytestreams,
       output.packed_accessor32<uint8_t, 3, torch::RestrictPtrTraits>();
 
 #ifndef LAUNCH_DECODE_PREFIX_KERNEL
-  #define LAUNCH_DECODE_PREFIX_KERNEL(block_size)                              \
-    decode_prefix_with_accessor_kernel<block_size><<<grid_dim, block_dim>>>(   \
+  #define LAUNCH_DECODE_PREFIX_KERNEL(block_size)                                  \
+    decode_prefix_with_accessor_kernel<block_size><<<grid_dim, block_dim, 0, stream>>>( \
         cdf_accessor, bytestreams_accessor, lengths_accessor, output_accessor, \
         lp, ntokens)
 #endif

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future, TimeoutError
-from typing import Any, Callable, List, Optional, Sequence, Set
+from typing import Any, Callable, Iterator, List, Optional, Sequence, Set
 import asyncio
 import threading
 import time
@@ -253,7 +253,15 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             self.put_tasks.add(key)
 
-        compressed_memory_obj = self.serializer.serialize(memory_obj)
+        is_makv = getattr(getattr(self, "config", None), "remote_serde", None) == "makv"
+        if is_makv:
+            compressed_memory_obj = self.serializer.serialize(
+                memory_obj,
+                transfer_spec=None,
+                key=key,
+            )
+        else:
+            compressed_memory_obj = self.serializer.serialize(memory_obj)
         memory_obj.ref_count_down()
 
         def put_done_callback(f: Future) -> None:
@@ -271,6 +279,33 @@ class RemoteBackend(StorageBackendInterface):
         )
         future.add_done_callback(put_done_callback)
         return future
+
+    def report_precision_risk(
+        self, key: CacheEngineKey, signal: Any
+    ) -> dict[str, Any]:
+        """Forward one MaKV runtime risk signal without affecting other serdes.
+
+        The method is intentionally a no-op response for non-MaKV backends so
+        the runtime vLLM hook can share a connector boundary without adding a
+        risk protocol to ``naive`` or ``cachegen``.
+        """
+        if self.config.remote_serde != "makv":
+            return {"accepted": False, "reason": "remote_serde_is_not_makv"}
+        if self.connection is None:
+            return {"accepted": False, "reason": "remote_connection_unavailable"}
+
+        report = getattr(self.connection, "report_precision_risk", None)
+        if not callable(report):
+            return {"accepted": False, "reason": "connector_does_not_support_risk"}
+        future = asyncio.run_coroutine_threadsafe(report(key, signal), self.loop)
+        try:
+            result = future.result(self.config.blocking_timeout_secs)
+        except Exception:
+            future.cancel()
+            raise
+        if isinstance(result, dict):
+            return result
+        return {"accepted": bool(result)}
 
     def batched_put_callback(self, future: Future, keys: List[CacheEngineKey]):
         """
@@ -306,9 +341,43 @@ class RemoteBackend(StorageBackendInterface):
                 memory_obj.ref_count_up()
 
             compressed_memory_objs = []
+            serialized_keys: list[CacheEngineKey] = []
             try:
-                for memory_obj in memory_objs:
-                    compressed_memory_objs.append(self.serializer.serialize(memory_obj))
+                is_makv = (
+                    getattr(getattr(self, "config", None), "remote_serde", None)
+                    == "makv"
+                )
+                chunk_starts = (
+                    None
+                    if not is_makv or transfer_spec is None
+                    else transfer_spec.get("chunk_starts")
+                )
+                chunk_ends = (
+                    None
+                    if not is_makv or transfer_spec is None
+                    else transfer_spec.get("chunk_ends")
+                )
+                for idx, (batch_key, memory_obj) in enumerate(
+                    zip(keys, memory_objs, strict=False)
+                ):
+                    if is_makv:
+                        item_transfer_spec = dict(transfer_spec or {})
+                        if chunk_starts is not None and idx < len(chunk_starts):
+                            item_transfer_spec["chunk_start"] = int(chunk_starts[idx])
+                        if chunk_ends is not None and idx < len(chunk_ends):
+                            item_transfer_spec["chunk_end"] = int(chunk_ends[idx])
+                        compressed_memory_objs.append(
+                            self.serializer.serialize(
+                                memory_obj,
+                                transfer_spec=item_transfer_spec,
+                                key=batch_key,
+                            )
+                        )
+                    else:
+                        compressed_memory_objs.append(
+                            self.serializer.serialize(memory_obj)
+                        )
+                    serialized_keys.append(batch_key)
             finally:
                 # Always decrement reference counts for all objects,
                 # regardless of whether serialization succeeded or failed
@@ -316,10 +385,10 @@ class RemoteBackend(StorageBackendInterface):
                     memory_obj.ref_count_down()
 
             def batched_done_callback(f: Future) -> None:
-                self.batched_put_callback(f, list(keys))
+                self.batched_put_callback(f, serialized_keys)
                 # Invoke per-key callback for each key in the batch
                 if on_complete_callback is not None:
-                    for key in keys:
+                    for key in serialized_keys:
                         try:
                             on_complete_callback(key)
                         except Exception as e:
@@ -328,7 +397,7 @@ class RemoteBackend(StorageBackendInterface):
                             )
 
             future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
+                self.connection.batched_put(serialized_keys, compressed_memory_objs),  # type: ignore
                 self.loop,
             )
             future.add_done_callback(batched_done_callback)
@@ -377,8 +446,17 @@ class RemoteBackend(StorageBackendInterface):
         if memory_obj is None:
             self._get_blocking_failed_count += 1
             return None
-        decompressed_memory_obj = self.deserializer.deserialize(memory_obj)
+        deserialize_started = time.perf_counter()
+        try:
+            decompressed_memory_obj = self.deserializer.deserialize(memory_obj)
+        except Exception as error:
+            logger.warning("Remote object deserialization failed: %s", error)
+            self._get_blocking_failed_count += 1
+            return None
         t3 = time.perf_counter()
+        self._record_makv_get_timing(
+            [memory_obj], (t3 - deserialize_started) * 1000
+        )
         logger.debug(
             "Get takes %.6f msec, deserialization takes %.6f msec",
             (t2 - t1) * 1000,
@@ -393,6 +471,107 @@ class RemoteBackend(StorageBackendInterface):
     @property
     def put_failed_count(self):
         return self._put_failed_count
+
+    def _record_makv_get_timing(
+        self, memory_objs: Sequence[Optional[MemoryObj]], deserialize_ms: float
+    ) -> None:
+        """Attach optional MaKV transport/manager timing to this retrieval.
+
+        Object attributes avoid an eager MaKV import in the common backend, so
+        non-MaKV serde modes keep their existing import and execution paths.
+        """
+        if getattr(getattr(self, "config", None), "remote_serde", None) != "makv":
+            return
+        if not any(
+            isinstance(getattr(memory_obj, "makv_server_timing", None), dict)
+            or isinstance(getattr(memory_obj, "makv_transport_timing", None), dict)
+            for memory_obj in memory_objs
+            if memory_obj is not None
+        ):
+            return
+        retrieve_stats = self.stats_monitor.get_current_retrieve_stats()
+        if retrieve_stats is None:
+            return
+        timing = retrieve_stats.detailed_metrics.setdefault(
+            "makv_latency",
+            {
+                "tcp_batches": 0,
+                "tcp_connect_ms": 0.0,
+                "tcp_send_ms": 0.0,
+                "tcp_first_response_ms": 0.0,
+                "tcp_receive_ms": 0.0,
+                "tcp_total_ms": 0.0,
+                "tcp_download_bytes": 0,
+                "manager_requests": 0,
+                "manager_hot_cache_hits": 0,
+                "manager_hot_cache_ms": 0.0,
+                "manager_storage_ms": 0.0,
+                "manager_validate_ms": 0.0,
+                "manager_total_ms": 0.0,
+                "manager_hot_cache_ms_max": 0.0,
+                "manager_storage_ms_max": 0.0,
+                "manager_validate_ms_max": 0.0,
+                "manager_total_ms_max": 0.0,
+                "manager_batch_storage_ms_max": 0.0,
+                "manager_batch_validate_ms_max": 0.0,
+                "manager_batch_total_ms_max": 0.0,
+                "deserialize_ms": 0.0,
+            },
+        )
+        timing["deserialize_ms"] += deserialize_ms
+        for memory_obj in memory_objs:
+            if memory_obj is None:
+                continue
+            transport = getattr(memory_obj, "makv_transport_timing", None)
+            if isinstance(transport, dict):
+                timing["tcp_batches"] += 1
+                timing["tcp_connect_ms"] += float(transport.get("connect_ms", 0.0))
+                timing["tcp_send_ms"] += float(transport.get("send_ms", 0.0))
+                timing["tcp_first_response_ms"] += float(
+                    transport.get("first_response_ms", 0.0)
+                )
+                timing["tcp_receive_ms"] += float(transport.get("receive_ms", 0.0))
+                timing["tcp_total_ms"] += float(transport.get("total_ms", 0.0))
+                delattr(memory_obj, "makv_transport_timing")
+            timing["tcp_download_bytes"] += len(memory_obj.byte_array)
+            server = getattr(memory_obj, "makv_server_timing", None)
+            if isinstance(server, dict):
+                hot_cache_ms = float(server.get("hot_cache_ms", 0.0))
+                storage_ms = float(server.get("storage_ms", 0.0))
+                validate_ms = float(server.get("validate_ms", 0.0))
+                total_ms = float(server.get("total_ms", 0.0))
+                batch_storage_ms = float(server.get("batch_storage_ms", 0.0))
+                batch_validate_ms = float(server.get("batch_validate_ms", 0.0))
+                batch_total_ms = float(server.get("batch_total_ms", 0.0))
+                timing["manager_requests"] += 1
+                timing["manager_hot_cache_hits"] += int(
+                    bool(server.get("hot_cache_hit", False))
+                )
+                timing["manager_hot_cache_ms"] += hot_cache_ms
+                timing["manager_storage_ms"] += storage_ms
+                timing["manager_validate_ms"] += validate_ms
+                timing["manager_total_ms"] += total_ms
+                timing["manager_hot_cache_ms_max"] = max(
+                    timing["manager_hot_cache_ms_max"], hot_cache_ms
+                )
+                timing["manager_storage_ms_max"] = max(
+                    timing["manager_storage_ms_max"], storage_ms
+                )
+                timing["manager_validate_ms_max"] = max(
+                    timing["manager_validate_ms_max"], validate_ms
+                )
+                timing["manager_total_ms_max"] = max(
+                    timing["manager_total_ms_max"], total_ms
+                )
+                timing["manager_batch_storage_ms_max"] = max(
+                    timing["manager_batch_storage_ms_max"], batch_storage_ms
+                )
+                timing["manager_batch_validate_ms_max"] = max(
+                    timing["manager_batch_validate_ms_max"], batch_validate_ms
+                )
+                timing["manager_batch_total_ms_max"] = max(
+                    timing["manager_batch_total_ms_max"], batch_total_ms
+                )
 
     def batched_get_blocking(
         self,
@@ -486,6 +665,7 @@ class RemoteBackend(StorageBackendInterface):
                 )
                 + duration
             )
+        deserialize_started = time.perf_counter()
         decompressed_memory_objs: list[Optional[MemoryObj]] = []
         error_happened = False
         for memory_obj in memory_objs:
@@ -493,17 +673,131 @@ class RemoteBackend(StorageBackendInterface):
                 error_happened = True
                 decompressed_memory_objs.append(None)
             else:
-                decompressed_memory_objs.append(
-                    self.deserializer.deserialize(memory_obj)
-                )
+                try:
+                    decompressed_memory_objs.append(
+                        self.deserializer.deserialize(memory_obj)
+                    )
+                except Exception as error:
+                    logger.warning("Remote object deserialization failed: %s", error)
+                    error_happened = True
+                    decompressed_memory_objs.append(None)
         if error_happened:
             self._get_blocking_failed_count += 1
+
+        self._record_makv_get_timing(
+            memory_objs, (time.perf_counter() - deserialize_started) * 1000
+        )
 
         assert len(decompressed_memory_objs) == len(keys), (
             f"keys length: {len(keys)}, "
             f"decompressed memory objs length: {len(decompressed_memory_objs)}"
         )
         return decompressed_memory_objs
+
+    def batched_get_streaming_blocking(
+        self, keys: List[CacheEngineKey]
+    ) -> Optional[Iterator[Optional[MemoryObj]]]:
+        """Return an ordered MaKV iterator that does not materialize GET_BATCH.
+
+        This is intentionally an opt-in connector capability rather than a new
+        abstract backend requirement.  Existing remote serde modes continue to
+        use ``batched_get_blocking`` unchanged.
+        """
+        # MaKV streaming returns a quantized MemoryObj that the GPU connector
+        # restores directly. Unlike the ordinary blocking path, it does not
+        # need a LocalCPUBackend allocator.
+        if self.connection is None:
+            return None
+        if self.config.remote_serde != "makv":
+            return None
+        support = getattr(self.connection, "support_batched_get_streaming", None)
+        stream_get = getattr(self.connection, "batched_get_streaming", None)
+        if not callable(support) or not support() or not callable(stream_get):
+            return None
+        if self._mla_worker_id_as0_mode:
+            keys = [key.with_new_worker_id(0) for key in keys]
+        return self._iter_streaming_makv_get(keys, stream_get)
+
+    def _iter_streaming_makv_get(
+        self,
+        keys: List[CacheEngineKey],
+        stream_get: Callable[[List[CacheEngineKey]], Any],
+    ) -> Iterator[Optional[MemoryObj]]:
+        """Bridge the connector's async generator to the cache-engine thread."""
+        started = time.perf_counter()
+        raw_memory_objs: list[Optional[MemoryObj]] = []
+        deserialize_ms = 0.0
+        failed = False
+        stream = stream_get(keys)
+        next_index = 0
+        try:
+            while next_index < len(keys):
+                future = asyncio.run_coroutine_threadsafe(stream.__anext__(), self.loop)
+                try:
+                    index, memory_obj = future.result(self.config.blocking_timeout_secs)
+                except StopAsyncIteration:
+                    logger.warning("MaKV streaming GET ended before all keys arrived")
+                    failed = True
+                    yield None
+                    break
+                except Exception as error:
+                    if isinstance(error, TimeoutError):
+                        future.cancel()
+                    logger.warning("MaKV streaming GET failed: %s", error)
+                    failed = True
+                    yield None
+                    break
+                if int(index) != next_index:
+                    logger.warning(
+                        "MaKV streaming GET response order mismatch: "
+                        "expected %d, got %s",
+                        next_index,
+                        index,
+                    )
+                    failed = True
+                    yield None
+                    break
+
+                raw_memory_objs.append(memory_obj)
+                if memory_obj is None:
+                    failed = True
+                    yield None
+                    break
+                deserialize_started = time.perf_counter()
+                try:
+                    result = self.deserializer.deserialize(memory_obj)
+                except Exception as error:
+                    logger.warning("Remote object deserialization failed: %s", error)
+                    failed = True
+                    result = None
+                deserialize_ms += (time.perf_counter() - deserialize_started) * 1000
+                yield result
+                if result is None:
+                    break
+                next_index += 1
+        finally:
+            try:
+                close_future = asyncio.run_coroutine_threadsafe(
+                    stream.aclose(), self.loop
+                )
+                close_future.result(self.config.blocking_timeout_secs)
+            except Exception as error:
+                logger.debug("MaKV streaming GET close failed: %s", error)
+            duration = time.perf_counter() - started
+            self.stats_monitor.update_interval_remote_time_to_get_sync(duration * 1000)
+            retrieve_stats = self.stats_monitor.get_current_retrieve_stats()
+            if retrieve_stats is not None:
+                retrieve_stats.detailed_metrics[
+                    "remote_backend_batched_get_blocking_time"
+                ] = (
+                    retrieve_stats.detailed_metrics.get(
+                        "remote_backend_batched_get_blocking_time", 0.0
+                    )
+                    + duration
+                )
+            self._record_makv_get_timing(raw_memory_objs, deserialize_ms)
+            if failed:
+                self._get_blocking_failed_count += 1
 
     async def support_batched_async_contains(self) -> bool:
         return (

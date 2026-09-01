@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
 # Standard
 import asyncio
 import gc
+import hashlib
+import json
 import multiprocessing
 import time
 
@@ -237,6 +240,19 @@ class LMCacheEngine:
 
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
+
+        self._makv_deferred_store_executor: Optional[ThreadPoolExecutor] = None
+        if (
+            config.remote_serde == "makv"
+            and config.get_extra_config_value(
+                "makv_scout_overlap_enabled", False
+            )
+            and config.get_extra_config_value("makv_scout_defer_store", True)
+        ):
+            self._makv_deferred_store_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="lmcache-makv-store",
+            )
 
         # Hidden-state cache (logically separate from KV; lives on its own
         # pinned pool). Bound to storage_manager in post_init for coupled
@@ -557,8 +573,106 @@ class LMCacheEngine:
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
+        if self._makv_deferred_store_executor is not None:
+            with store_stats.profile_put():
+                future = self._makv_deferred_store_executor.submit(
+                    self._deferred_makv_put,
+                    list(keys),
+                    memory_objs,
+                    list(starts),
+                    list(ends),
+                    kwargs.get("transfer_spec"),
+                    kwargs.get("request_configs"),
+                    kwargs.get("request_token_count"),
+                    tokens,
+                    req_id,
+                )
+
+                def log_deferred_failure(completed_future) -> None:
+                    error = completed_future.exception()
+                    if error is not None:
+                        logger.error(
+                            "[req_id=%s] Deferred MaKV store failed: %s",
+                            req_id,
+                            error,
+                        )
+
+                future.add_done_callback(log_deferred_failure)
+            self.stats_monitor.on_store_finished(store_stats, tot_token_num)
+            logger.info(
+                "[req_id=%s] Deferred MaKV store for %d tokens after "
+                "GPU-to-CPU copy; %.4f GB retained until ScoutRank is ready",
+                req_id,
+                tot_token_num,
+                tot_kv_size / 1024**3,
+            )
+            return
+
+        if self.config.remote_serde == "makv":
+            try:
+                from lmcache.v1.storage_backend.makv.scout_overlap import (
+                    resolve_scout_importance,
+                )
+
+                resolved_request_configs = resolve_scout_importance(
+                    self.config,
+                    request_id=req_id,
+                    token_count=kwargs.get("request_token_count"),
+                    request_configs=kwargs.get("request_configs"),
+                )
+                kwargs["request_configs"] = resolved_request_configs
+                timing = (resolved_request_configs or {}).get(
+                    "lmcache.makv_scoutrank_timing"
+                )
+                if isinstance(timing, dict):
+                    logger.info(
+                        "[req_id=%s] ScoutRank overlap: score %.3f ms, "
+                        "store wait %.3f ms, hidden %.3f ms",
+                        req_id,
+                        float(timing.get("score_time_ms", 0.0)),
+                        float(timing.get("client_wait_time_ms", 0.0)),
+                        float(timing.get("overlap_hidden_time_ms", 0.0)),
+                    )
+            except Exception as error:
+                # Missing importance follows the configured MaKV fallback
+                # (normally a lossless naive envelope) without affecting the
+                # model response or any native serde mode.
+                logger.warning(
+                    "[req_id=%s] ScoutRank overlap join failed; applying MaKV "
+                    "fallback: %s",
+                    req_id,
+                    error,
+                )
+
         with store_stats.profile_put():
-            transfer_spec = kwargs.get("transfer_spec", None)
+            raw_transfer_spec = kwargs.get("transfer_spec", None)
+            if self.config.remote_serde == "makv":
+                transfer_spec = dict(raw_transfer_spec or {})
+                transfer_spec.setdefault("chunk_starts", list(starts))
+                transfer_spec.setdefault("chunk_ends", list(ends))
+                transfer_spec.setdefault(
+                    "request_token_count",
+                    kwargs.get(
+                        "request_token_count",
+                        len(tokens) if tokens is not None else None,
+                    ),
+                )
+                transfer_spec.setdefault(
+                    "request_configs", kwargs.get("request_configs")
+                )
+                request_configs = transfer_spec.get("request_configs") or {}
+                if (
+                    tokens is not None
+                    and "lmcache.makv_precision_plan" in request_configs
+                    and "prompt_token_hash" not in transfer_spec
+                ):
+                    token_ids = convert_tokens_to_list(tokens, 0, len(tokens) - 1)
+                    encoded = ",".join(str(int(value)) for value in token_ids).encode()
+                    transfer_spec["prompt_token_hash"] = hashlib.sha256(
+                        encoded
+                    ).hexdigest()
+            else:
+                transfer_spec = raw_transfer_spec
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(
@@ -586,6 +700,88 @@ class LMCacheEngine:
             tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
             (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
             store_stats.put_time * 1000,
+        )
+
+    def _deferred_makv_put(
+        self,
+        keys: list[CacheEngineKey],
+        memory_objs: list[MemoryObj],
+        starts: list[int],
+        ends: list[int],
+        raw_transfer_spec: Any,
+        request_configs: Optional[dict[str, Any]],
+        request_token_count: Optional[int],
+        tokens: Optional[Union[torch.Tensor, list[int]]],
+        req_id: Optional[str],
+    ) -> None:
+        """Join ScoutRank and submit a PUT without blocking chunked prefill."""
+        resolved_configs = request_configs
+        try:
+            from lmcache.v1.storage_backend.makv.scout_overlap import (
+                resolve_scout_importance,
+            )
+
+            resolved_configs = resolve_scout_importance(
+                self.config,
+                request_id=req_id,
+                token_count=request_token_count,
+                request_configs=request_configs,
+                deferred=True,
+            )
+            timing = (resolved_configs or {}).get(
+                "lmcache.makv_scoutrank_timing"
+            )
+            if isinstance(timing, dict):
+                logger.info(
+                    "[req_id=%s] ScoutRank deferred overlap: score %.3f ms, "
+                    "background wait %.3f ms, hidden %.3f ms",
+                    req_id,
+                    float(timing.get("score_time_ms", 0.0)),
+                    float(timing.get("client_wait_time_ms", 0.0)),
+                    float(timing.get("overlap_hidden_time_ms", 0.0)),
+                )
+        except Exception as error:
+            logger.warning(
+                "[req_id=%s] Deferred ScoutRank join failed; applying MaKV "
+                "fallback: %s",
+                req_id,
+                error,
+            )
+
+        transfer_spec = dict(raw_transfer_spec or {})
+        transfer_spec.setdefault("chunk_starts", starts)
+        transfer_spec.setdefault("chunk_ends", ends)
+        transfer_spec.setdefault("request_token_count", request_token_count)
+        transfer_spec["request_configs"] = resolved_configs
+        if (
+            tokens is not None
+            and resolved_configs is not None
+            and "lmcache.makv_precision_plan" in resolved_configs
+            and "prompt_token_hash" not in transfer_spec
+        ):
+            token_ids = convert_tokens_to_list(tokens, 0, len(tokens) - 1)
+            encoded = ",".join(str(int(value)) for value in token_ids).encode()
+            transfer_spec["prompt_token_hash"] = hashlib.sha256(encoded).hexdigest()
+
+        assert self.storage_manager is not None
+        try:
+            self.storage_manager.batched_put(
+                keys,
+                memory_objs,
+                transfer_spec=transfer_spec,
+                location=self.store_location,
+            )
+        except Exception:
+            # batched_put normally consumes the allocation's original
+            # reference. If submission fails before that point, release the
+            # buffers retained by the deferred queue.
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
+            raise
+        logger.info(
+            "[req_id=%s] Submitted deferred MaKV PUT for %d chunks",
+            req_id,
+            len(keys),
         )
 
     @_lmcache_nvtx_annotate
@@ -834,6 +1030,30 @@ class LMCacheEngine:
         retrieve_stats = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        makv_stream_restore_state: dict[str, Any] | None = None
+        streaming_restore = self.config.get_extra_config_value(
+            "makv_streaming_restore", True
+        )
+        if isinstance(streaming_restore, str):
+            streaming_restore = streaming_restore.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if (
+            bool(streaming_restore)
+            and self.config.remote_serde == "makv"
+            and not self.async_loading
+            and not self.save_only_first_rank
+            and self.gpu_connector is not None
+            and hasattr(self.gpu_connector, "load_stream")
+        ):
+            makv_stream_restore_state = {
+                "restored_memory_obj_ids": set(),
+                "restore_result": None,
+                "streamed_chunks": 0,
+            }
 
         reordered_chunks: List[ProcessedChunk] = []
         if not self._is_passive():
@@ -850,8 +1070,17 @@ class LMCacheEngine:
                         tokens,
                         mask,
                         ret_mask,
+                        _makv_stream_restore_state=makv_stream_restore_state,
                         **kwargs,
                     )
+
+        if makv_stream_restore_state is not None:
+            restore_result = makv_stream_restore_state.get("restore_result")
+            if isinstance(restore_result, dict):
+                restore_result["makv_streaming_restore_chunks"] = int(
+                    makv_stream_restore_state["streamed_chunks"]
+                )
+                retrieve_stats.detailed_metrics["makv_restore"] = restore_result
 
         if self.save_only_first_rank:
             with retrieve_stats.profile_broadcast():
@@ -876,7 +1105,20 @@ class LMCacheEngine:
         # RDMA is another example.
         if len(reordered_chunks) > 0:
             with retrieve_stats.profile_to_gpu():
-                _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+                streamed_ids = (
+                    makv_stream_restore_state["restored_memory_obj_ids"]
+                    if makv_stream_restore_state is not None
+                    else set()
+                )
+                chunks_to_gpu = [
+                    chunk
+                    for chunk in reordered_chunks
+                    if id(chunk[1]) not in streamed_ids
+                ]
+                if chunks_to_gpu:
+                    _, memory_objs, starts, ends = zip(*chunks_to_gpu, strict=False)
+                else:
+                    memory_objs = starts = ends = ()
                 # When save_only_first_rank is enabled, the leader rank's
                 # memory_objs from L1 are CPU-resident. The broadcast above
                 # already created GPU-resident copies on the leader to use as
@@ -907,9 +1149,17 @@ class LMCacheEngine:
                 else:
                     memory_objs_for_togpu = list(memory_objs)
                 try:
-                    self.gpu_connector.batched_to_gpu(
-                        memory_objs_for_togpu, list(starts), list(ends), **kwargs
-                    )
+                    if chunks_to_gpu:
+                        restore_result = self.gpu_connector.batched_to_gpu(
+                            memory_objs_for_togpu, list(starts), list(ends), **kwargs
+                        )
+                        if (
+                            isinstance(restore_result, dict)
+                            and "makv_restore_calls" in restore_result
+                        ):
+                            retrieve_stats.detailed_metrics["makv_restore"] = (
+                                restore_result
+                            )
                 finally:
                     # Release GPU substitute references so the temporary
                     # buffers can be freed; original memory_objs in
@@ -967,6 +1217,147 @@ class LMCacheEngine:
                 onload_time * 1000,
                 tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
             )
+            makv_latency = retrieve_stats.detailed_metrics.get("makv_latency")
+            makv_restore = retrieve_stats.detailed_metrics.get("makv_restore")
+            if self.config.remote_serde == "makv" and (
+                isinstance(makv_latency, dict) or isinstance(makv_restore, dict)
+            ):
+                transport = makv_latency if isinstance(makv_latency, dict) else {}
+                restore = makv_restore if isinstance(makv_restore, dict) else {}
+                total_ms = onload_time * 1000
+                network_ms = float(transport.get("tcp_total_ms", 0.0))
+                deserialize_ms = float(transport.get("deserialize_ms", 0.0))
+                prepare_ms = float(restore.get("makv_restore_cpu_prepare_time_ms", 0.0))
+                h2d_ms = float(restore.get("makv_h2d_time_ms", 0.0))
+                kernel_ms = float(
+                    restore.get("makv_dequant_kernel_time_ms", 0.0)
+                )
+                gpu_restore_ms = float(
+                    restore.get("makv_restore_gpu_total_time_ms", 0.0)
+                )
+                tcp_receive_ms = float(transport.get("tcp_receive_ms", 0.0))
+                manager_critical_path_ms = max(
+                    float(transport.get("manager_total_ms_max", 0.0)),
+                    float(transport.get("manager_batch_total_ms_max", 0.0)),
+                )
+                tcp_download_bytes = int(transport.get("tcp_download_bytes", 0))
+                accounted_ms = network_ms + deserialize_ms + prepare_ms + gpu_restore_ms
+                gpu_data_ms = h2d_ms + kernel_ms
+                breakdown = {
+                    "retrieve_total_ms": round(total_ms, 3),
+                    "process_tokens_ms": round(
+                        retrieve_stats.process_tokens_time * 1000, 3
+                    ),
+                    "to_gpu_wall_ms": round(retrieve_stats.to_gpu_time * 1000, 3),
+                    "tcp_batches": int(transport.get("tcp_batches", 0)),
+                    "tcp_connect_ms": round(
+                        float(transport.get("tcp_connect_ms", 0.0)), 3
+                    ),
+                    "tcp_send_ms": round(
+                        float(transport.get("tcp_send_ms", 0.0)), 3
+                    ),
+                    "tcp_first_response_ms": round(
+                        float(transport.get("tcp_first_response_ms", 0.0)), 3
+                    ),
+                    "tcp_receive_ms": round(
+                        tcp_receive_ms, 3
+                    ),
+                    "tcp_total_ms": round(network_ms, 3),
+                    "tcp_download_bytes": tcp_download_bytes,
+                    "tcp_receive_effective_GBps": round(
+                        tcp_download_bytes / tcp_receive_ms / 1024**3 * 1000,
+                        4,
+                    )
+                    if tcp_receive_ms
+                    else 0.0,
+                    # This is the TCP receive time left after the longest
+                    # manager GET in the batch. It includes socket framing and
+                    # copying, so it is an upper bound on wire-only time.
+                    "tcp_non_manager_receive_residual_ms": round(
+                        max(0.0, tcp_receive_ms - manager_critical_path_ms), 3
+                    ),
+                    "manager_requests": int(transport.get("manager_requests", 0)),
+                    "manager_hot_cache_hits": int(
+                        transport.get("manager_hot_cache_hits", 0)
+                    ),
+                    "manager_hot_cache_ms_sum": round(
+                        float(transport.get("manager_hot_cache_ms", 0.0)), 3
+                    ),
+                    "manager_storage_ms_sum": round(
+                        float(transport.get("manager_storage_ms", 0.0)), 3
+                    ),
+                    "manager_validate_ms_sum": round(
+                        float(transport.get("manager_validate_ms", 0.0)), 3
+                    ),
+                    "manager_total_ms_sum": round(
+                        float(transport.get("manager_total_ms", 0.0)), 3
+                    ),
+                    "manager_total_ms_critical_path": round(
+                        manager_critical_path_ms, 3
+                    ),
+                    "manager_batch_storage_ms": round(
+                        float(transport.get("manager_batch_storage_ms_max", 0.0)),
+                        3,
+                    ),
+                    "manager_batch_validate_ms": round(
+                        float(transport.get("manager_batch_validate_ms_max", 0.0)),
+                        3,
+                    ),
+                    "manager_batch_total_ms": round(
+                        float(transport.get("manager_batch_total_ms_max", 0.0)),
+                        3,
+                    ),
+                    "deserialize_ms": round(deserialize_ms, 3),
+                    "restore_cpu_prepare_ms": round(prepare_ms, 3),
+                    "restore_blob_pin_ms": round(
+                        float(restore.get("makv_restore_cpu_blob_pin_time_ms", 0.0)),
+                        3,
+                    ),
+                    "restore_dtype_convert_ms": round(
+                        float(
+                            restore.get("makv_restore_cpu_dtype_convert_time_ms", 0.0)
+                        ),
+                        3,
+                    ),
+                    "restore_extra_pin_ms": round(
+                        float(restore.get("makv_restore_cpu_pin_time_ms", 0.0)), 3
+                    ),
+                    "h2d_ms": round(h2d_ms, 3),
+                    "fused_paged_kernel_ms": round(kernel_ms, 3),
+                    "restore_gpu_total_ms": round(gpu_restore_ms, 3),
+                    "h2d_bytes": int(restore.get("makv_h2d_bytes", 0)),
+                    "kernel_launch_count": int(
+                        restore.get("makv_kernel_launch_count", 0)
+                    ),
+                    "other_unattributed_ms": round(
+                        max(0.0, total_ms - accounted_ms), 3
+                    ),
+                    "tcp_share_of_retrieve_pct": round(
+                        100 * network_ms / total_ms, 2
+                    )
+                    if total_ms
+                    else 0.0,
+                    "manager_critical_path_share_of_tcp_receive_pct": round(
+                        100 * manager_critical_path_ms / tcp_receive_ms, 2
+                    )
+                    if tcp_receive_ms
+                    else 0.0,
+                    "h2d_share_of_gpu_restore_pct": round(
+                        100 * h2d_ms / gpu_data_ms, 2
+                    )
+                    if gpu_data_ms
+                    else 0.0,
+                    "kernel_share_of_gpu_restore_pct": round(
+                        100 * kernel_ms / gpu_data_ms, 2
+                    )
+                    if gpu_data_ms
+                    else 0.0,
+                }
+                logger.info(
+                    "[req_id=%s] MaKV latency breakdown: %s",
+                    req_id,
+                    json.dumps(breakdown, sort_keys=True),
+                )
         return ret_mask
 
     @_lmcache_nvtx_annotate
@@ -1554,6 +1945,58 @@ class LMCacheEngine:
         ):
             self.cleanup_memory_objs(lookup_id)
 
+    def report_precision_risk(
+        self,
+        tokens: Union[torch.Tensor, List[int], Sequence[int]],
+        token_index: int,
+        signal: Mapping[str, Any],
+        request_configs: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        """Route one absolute-token risk signal to a MaKV remote backend.
+
+        The token database is the single source of truth for cache-key and
+        chunk boundaries.  This prevents a runtime observer from guessing a
+        key or accidentally using a decode step as a KV position.  Non-MaKV
+        configurations return a closed, non-error response and do not enter
+        any existing serde path.
+        """
+        if self.config.remote_serde != "makv":
+            return {"accepted": False, "reason": "remote_serde_is_not_makv"}
+        if self.storage_manager is None:
+            return {"accepted": False, "reason": "storage_manager_unavailable"}
+        if (
+            isinstance(token_index, bool)
+            or not isinstance(token_index, int)
+            or token_index < 0
+            or token_index >= len(tokens)
+        ):
+            return {"accepted": False, "reason": "token_index_out_of_range"}
+        if not isinstance(signal, Mapping):
+            raise TypeError("precision risk signal must be a mapping")
+
+        target_key: Optional[CacheEngineKey] = None
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            request_configs=request_configs,
+        ):
+            if start <= token_index < end:
+                if not isinstance(key, CacheEngineKey):
+                    return {"accepted": False, "reason": "cache_key_unavailable"}
+                target_key = key
+                break
+        if target_key is None:
+            return {"accepted": False, "reason": "token_chunk_unavailable"}
+
+        for backend_name in self.storage_manager.get_non_allocator_backends():
+            backend = self.storage_manager.storage_backends.get(backend_name)
+            report = getattr(backend, "report_precision_risk", None)
+            if callable(report):
+                result = report(target_key, signal)
+                if isinstance(result, dict):
+                    return result
+                return {"accepted": bool(result)}
+        return {"accepted": False, "reason": "makv_remote_backend_unavailable"}
+
     @_lmcache_nvtx_annotate
     def clear(
         self,
@@ -1614,6 +2057,13 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
+
+        if self._makv_deferred_store_executor is not None:
+            logger.info("Draining deferred MaKV stores...")
+            self._makv_deferred_store_executor.shutdown(
+                wait=True, cancel_futures=False
+            )
+            self._makv_deferred_store_executor = None
 
         if self.hidden_state_store is not None:
             try:
@@ -1724,6 +2174,10 @@ class LMCacheEngine:
         """
         assert self.storage_manager is not None
 
+        # This private state is supplied only by the synchronous retrieve path.
+        # It is removed from kwargs before they reach a GPU connector.
+        makv_stream_restore_state = kwargs.pop("_makv_stream_restore_state", None)
+
         tot_kv_size = 0
         reordered_chunks: List[ProcessedChunk] = []
         request_configs = kwargs.get("request_configs")
@@ -1753,10 +2207,84 @@ class LMCacheEngine:
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
-            memory_objs = self.storage_manager.batched_get(
-                keys=keys,
-                location=location,
+            memory_obj_stream = (
+                self.storage_manager.batched_get_streaming(keys=keys, location=location)
+                if makv_stream_restore_state is not None
+                else None
             )
+            if memory_obj_stream is None:
+                memory_objs = self.storage_manager.batched_get(
+                    keys=keys,
+                    location=location,
+                )
+            else:
+                # Submit each quantized object to the existing direct paged
+                # restore path as soon as its socket segment arrives.  The
+                # load stream is synchronized once after the iterator ends;
+                # while the CPU waits for the next segment, H2D/arithmetic
+                # decode/paged scatter for the previous chunk keep running.
+                from lmcache.v1.gpu_connector.makv_restore import (
+                    begin_makv_restore_timing_scope,
+                    finish_makv_restore_timing_scope,
+                    is_makv_quantized_memory_obj,
+                )
+
+                memory_objs = []
+                makv_scope: int | None = None
+                try:
+                    for (key, start, end), memory_obj in zip(
+                        blocks, memory_obj_stream, strict=False
+                    ):
+                        memory_objs.append(memory_obj)
+                        if memory_obj is None:
+                            break
+                        if not is_makv_quantized_memory_obj(memory_obj):
+                            continue
+                        if makv_scope is None:
+                            makv_scope = begin_makv_restore_timing_scope()
+                        assert self.gpu_connector is not None
+                        self.gpu_connector.batched_to_gpu(
+                            [memory_obj],
+                            [start],
+                            [end],
+                            **{
+                                **kwargs,
+                                "makv_timing_scope": makv_scope,
+                                "makv_defer_synchronize": True,
+                            },
+                        )
+                        makv_stream_restore_state["restored_memory_obj_ids"].add(
+                            id(memory_obj)
+                        )
+                        makv_stream_restore_state["streamed_chunks"] += 1
+                finally:
+                    close = getattr(memory_obj_stream, "close", None)
+                    if callable(close):
+                        close()
+                    if makv_scope is not None:
+                        assert self.gpu_connector is not None
+                        try:
+                            self.gpu_connector.load_stream.synchronize()
+                        finally:
+                            restore_result = finish_makv_restore_timing_scope(
+                                makv_scope
+                            )
+                            previous_result = makv_stream_restore_state.get(
+                                "restore_result"
+                            )
+                            if isinstance(previous_result, dict):
+                                for name, value in restore_result.items():
+                                    previous_result[name] = (
+                                        previous_result.get(name, 0) + value
+                                    )
+                            else:
+                                makv_stream_restore_state["restore_result"] = (
+                                    restore_result
+                                )
+                if len(memory_objs) < len(blocks):
+                    # Treat a truncated stream exactly like a remote cache
+                    # miss.  The caller will only expose the valid prefix.
+                    memory_objs.append(None)
 
             used_keys: set[CacheEngineKey] = set()
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):

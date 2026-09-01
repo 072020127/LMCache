@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -134,6 +135,30 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return block IDs that failed to load during the last interval."""
         return self._lmcache_engine.get_block_ids_with_load_errors()
+
+    def submit_precision_risk(
+        self,
+        request_id: str,
+        logits: torch.Tensor,
+        step: int,
+        token_index: int,
+        prompt_token_ids: list[int],
+        request_params: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Forward an opt-in real-logit MaKV risk observation."""
+        method = getattr(self._lmcache_engine, "submit_precision_risk", None)
+        if not callable(method):
+            return False
+        return bool(
+            method(
+                request_id,
+                logits,
+                step,
+                token_index,
+                prompt_token_ids,
+                request_params,
+            )
+        )
 
     def shutdown(self):
         """

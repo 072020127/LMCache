@@ -16,6 +16,8 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemGPUConnectorV3,
     VLLMPagedMemLayerwiseGPUConnector,
+    _allocate_fused_kv_tensor,
+    _pack_split_kv_for_fused_cache,
 )
 from lmcache.v1.gpu_connector.utils import get_dtype
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
@@ -59,6 +61,26 @@ from .utils import (
     generate_sglang_kv_cache_paged_list_tensors,
     recover_gpu_connector_states,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_fused_cpu_transfer_buffers_are_pinned():
+    """Fused CPU staging buffers must be CUDA-registered for H2D/D2H."""
+    engine_kv_format = lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS
+    source = torch.empty(
+        (2, 2, 5, 4 * 8),
+        dtype=torch.float16,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    packed = _pack_split_kv_for_fused_cache(
+        source, engine_kv_format, num_heads=4, content_size=16
+    )
+    target = _allocate_fused_kv_tensor(source, num_heads=4, content_size=16)
+
+    assert packed.is_pinned()
+    assert target.is_pinned()
 
 
 @pytest.fixture(autouse=True, scope="module")

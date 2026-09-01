@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import Any, AsyncIterator, List, Optional
 import time
 
 # First Party
@@ -69,6 +69,20 @@ class InstrumentedRemoteConnector(RemoteConnector):
             )
         return memory_obj
 
+    async def report_precision_risk(
+        self, key: CacheEngineKey, signal: Any
+    ) -> dict[str, Any]:
+        """Delegate the optional MaKV risk protocol to the wrapped connector."""
+        report = getattr(self._connector, "report_precision_risk", None)
+        if not callable(report):
+            raise NotImplementedError(
+                f"Connector {self._connector} does not support precision risk"
+            )
+        result = await report(key, signal)
+        if isinstance(result, dict):
+            return result
+        return {"accepted": bool(result)}
+
     # Delegate all other methods to the underlying connector
     async def exists(self, key: CacheEngineKey) -> bool:
         return await self._connector.exists(key)
@@ -96,6 +110,23 @@ class InstrumentedRemoteConnector(RemoteConnector):
 
     def support_batched_get(self) -> bool:
         return self._connector.support_batched_get()
+
+    def support_batched_get_streaming(self) -> bool:
+        """Expose optional streaming GET support from the wrapped connector."""
+        support = getattr(self._connector, "support_batched_get_streaming", None)
+        return callable(support) and bool(support())
+
+    async def batched_get_streaming(
+        self, keys: List[CacheEngineKey]
+    ) -> AsyncIterator[tuple[int, Optional[MemoryObj]]]:
+        """Delegate ordered streaming GET without materializing the batch."""
+        stream_get = getattr(self._connector, "batched_get_streaming", None)
+        if not callable(stream_get):
+            raise NotImplementedError(
+                f"Connector {self._connector} does not support streaming GET"
+            )
+        async for index, memory_obj in stream_get(keys):
+            yield index, memory_obj
 
     def support_batched_async_contains(self) -> bool:
         return self._connector.support_batched_async_contains()

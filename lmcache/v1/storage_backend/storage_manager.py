@@ -8,6 +8,7 @@ from typing import (
     Coroutine,
     Dict,
     Generator,
+    Iterator,
     List,
     Optional,
     Sequence,
@@ -511,6 +512,28 @@ class StorageManager:
                     local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
                 return memory_objs
         return [None] * len(keys)
+
+    def batched_get_streaming(
+        self,
+        keys: List[CacheEngineKey],
+        location: Optional[str] = None,
+    ) -> Optional[Iterator[Optional[MemoryObj]]]:
+        """Return an ordered streaming batch iterator when a backend supports it.
+
+        The capability is currently used by MaKV's network connector.  Keeping
+        it optional preserves every existing backend's blocking batch contract
+        and avoids an allocator/write-back copy before direct paged restore.
+        """
+        for _, storage_backend in self.get_active_storage_backends(location):
+            streaming_get = getattr(
+                storage_backend, "batched_get_streaming_blocking", None
+            )
+            if not callable(streaming_get):
+                continue
+            result = streaming_get(keys)
+            if result is not None:
+                return result
+        return None
 
     def layerwise_batched_get(
         self,

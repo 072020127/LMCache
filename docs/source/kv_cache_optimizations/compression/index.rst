@@ -11,3 +11,4 @@ Currently, we support the following compression algorithms:
    :maxdepth: 1
 
    cachegen
+   makv

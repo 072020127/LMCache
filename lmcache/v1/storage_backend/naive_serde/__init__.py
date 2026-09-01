@@ -35,6 +35,16 @@ def CreateSerde(
             CacheGenSerializer(config, metadata),
             CacheGenDeserializer(config, metadata),
         )
+    elif serde_type == "makv":
+        from lmcache.v1.storage_backend.makv.serde import (
+            MaKVDeserializer,
+            MaKVSerializer,
+        )
+
+        s, d = (
+            MaKVSerializer(config, metadata),
+            MaKVDeserializer(config, metadata),
+        )
     else:
         raise ValueError(f"Invalid type: {serde_type}")
 

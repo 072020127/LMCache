@@ -2,6 +2,7 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import importlib
 
 # Third Party
 import torch
@@ -22,8 +23,10 @@ from lmcache.v1.gpu_connector.utils import (
     get_device,
     get_elements_per_layer,
     get_group_data_ptrs,
+    get_dtype,
     get_head_size,
     get_num_blocks,
+    get_num_heads,
     get_num_layers,
     get_page_buffer_size,
     get_tokens_per_layer,
@@ -38,6 +41,141 @@ from lmcache.v1.platform.ops_types import set_shape_desc_dtype
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+def is_makv_quantized_memory_obj(memory_obj) -> bool:
+    """Detect MaKV objects without importing MaKV on native connector paths."""
+    if getattr(memory_obj, "object_type", None) == "makv_quantized":
+        return True
+    cls = type(memory_obj)
+    return (
+        cls.__name__ == "MaKVQuantizedMemoryObj"
+        and cls.__module__.startswith("lmcache.v1.storage_backend.makv")
+    )
+
+
+def restore_makv_quantized_to_paged(memory_obj, *args, **kwargs):
+    """Load MaKV restore code only after a MaKV object is detected."""
+    module = importlib.import_module("lmcache.v1.gpu_connector.makv_restore")
+    return module.restore_makv_quantized_to_paged(memory_obj, *args, **kwargs)
+
+
+def begin_makv_restore_timing_scope() -> int:
+    """Create a MaKV timing scope lazily for MaKV-only batches."""
+    module = importlib.import_module("lmcache.v1.gpu_connector.makv_restore")
+    return module.begin_makv_restore_timing_scope()
+
+
+def finish_makv_restore_timing_scope(scope_id: int):
+    """Finish a lazily-created MaKV timing scope."""
+    module = importlib.import_module("lmcache.v1.gpu_connector.makv_restore")
+    return module.finish_makv_restore_timing_scope(scope_id)
+_FUSED_KV_FORMATS = frozenset(
+    {
+        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_CS,
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_CS,
+    }
+)
+_HND_FUSED_KV_FORMATS = frozenset(
+    {
+        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_CS,
+    }
+)
+
+
+def _is_fused_kv_format(engine_kv_format) -> bool:
+    return engine_kv_format in _FUSED_KV_FORMATS
+
+
+def _fused_transfer_head_size(engine_kv_format, content_size: int) -> int:
+    """Return the logical head size expected by the paged transfer kernel."""
+    if engine_kv_format in _HND_FUSED_KV_FORMATS:
+        if content_size % 2:
+            raise ValueError("Fused K/V content size must be even")
+        return content_size // 2
+    return content_size
+
+
+def _pack_split_kv_for_fused_cache(
+    tensor: torch.Tensor,
+    engine_kv_format,
+    num_heads: int,
+    content_size: int,
+) -> torch.Tensor:
+    """Pack [2, L, T, NH*HS] into the engine's fused [1, L, T, ...]."""
+    if not _is_fused_kv_format(engine_kv_format):
+        return tensor
+    if tensor.ndim != 4 or tensor.shape[0] != 2:
+        return tensor
+    if content_size % 2:
+        raise ValueError("Fused K/V content size must be even")
+    head_size = content_size // 2
+    expected_hidden = num_heads * head_size
+    if tensor.shape[3] != expected_hidden:
+        raise ValueError(
+            "Split K/V tensor hidden size does not match fused paged cache: "
+            f"got {tensor.shape[3]}, expected {expected_hidden}"
+        )
+    layers, tokens = tensor.shape[1], tensor.shape[2]
+    packed_view = (
+        tensor.reshape(2, layers, tokens, num_heads, head_size)
+        .permute(1, 2, 3, 0, 4)
+        .reshape(1, layers, tokens, num_heads * content_size)
+    )
+    # The fused view is not contiguous, so ``contiguous()`` would allocate
+    # pageable host memory even when the source came from LMCache's custom
+    # pinned allocator.  The transfer kernel requires a CUDA-registered host
+    # pointer; allocate the packing buffer as pinned memory before copying.
+    kwargs = {}
+    if tensor.device.type == "cpu" and torch.cuda.is_available():
+        kwargs["pin_memory"] = True
+    packed = torch.empty(
+        (1, layers, tokens, num_heads * content_size),
+        dtype=tensor.dtype,
+        device=tensor.device,
+        **kwargs,
+    )
+    packed.copy_(packed_view)
+    return packed
+
+
+def _allocate_fused_kv_tensor(
+    split_tensor: torch.Tensor,
+    num_heads: int,
+    content_size: int,
+) -> torch.Tensor:
+    """Allocate a transfer target while preserving pinned CPU allocation."""
+    shape = (1, split_tensor.shape[1], split_tensor.shape[2], num_heads * content_size)
+    kwargs = {}
+    if split_tensor.device.type == "cpu" and torch.cuda.is_available():
+        # ``Tensor.is_pinned()`` is false for LMCache's cudaHostAlloc-backed
+        # tensors even though CUDA can access them.  The newly allocated
+        # fused transfer target must nevertheless be explicitly pinned.
+        kwargs["pin_memory"] = True
+    return torch.empty(
+        shape, dtype=split_tensor.dtype, device=split_tensor.device, **kwargs
+    )
+
+
+def _unpack_fused_kv_to_split(
+    fused_tensor: torch.Tensor,
+    split_tensor: torch.Tensor,
+    num_heads: int,
+    content_size: int,
+) -> None:
+    """Unpack an engine fused tensor into LMCache's split K/V tensor."""
+    head_size = content_size // 2
+    unpacked = (
+        fused_tensor.reshape(
+            split_tensor.shape[1], split_tensor.shape[2], num_heads, 2, head_size
+        )
+        .permute(3, 0, 1, 2, 4)
+        .reshape_as(split_tensor)
+    )
+    split_tensor.copy_(unpacked)
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -282,7 +420,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
-        assert memory_obj.tensor is not None
+        is_makv = is_makv_quantized_memory_obj(memory_obj)
+        if not is_makv:
+            assert memory_obj.tensor is not None
 
         self.initialize_kvcaches_ptr(**kwargs)
 
@@ -290,13 +430,13 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
-        if self.use_mla:
+        if not is_makv and self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
                 raise ValueError(
                     "The memory object should be in KV_MLA_FMT format in"
                     " order to be processed by VLLMPagedMemGPUConnector"
                 )
-        else:
+        elif not is_makv:
             if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
                 raise ValueError(
                     "The memory object should be in KV_2LTD format in"
@@ -316,8 +456,43 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
+        if is_makv:
+            expected_dtype = getattr(
+                torch,
+                memory_obj.makv_metadata["plan"]["original_dtype"].replace(
+                    "torch.", ""
+                ),
+            )
+            if any(
+                get_dtype(self.kvcaches, self.engine_kv_format, layer) != expected_dtype
+                for layer in range(self.num_layers)
+            ):
+                raise ValueError("MaKV dtype does not match paged KV cache")
+            restore_makv_quantized_to_paged(
+                memory_obj,
+                device=self.device,
+                page_ptrs=kv_cache_pointers,
+                slot_mapping=slot_mapping[start:end],
+                page_buffer_size=self.page_buffer_size,
+                block_size=self.block_size,
+                head_size=self.head_size,
+                engine_kv_format=self.engine_kv_format,
+                skip_prefix_n_tokens=skip_prefix_n_tokens,
+                require_cuda=bool(kwargs.get("makv_require_cuda_dequant", True)),
+                timing_scope=kwargs.get("makv_timing_scope"),
+            )
+            return
+
+        memory_tensor = memory_obj.tensor
+        assert memory_tensor is not None
+        transfer_tensor = _pack_split_kv_for_fused_cache(
+            memory_tensor,
+            self.engine_kv_format,
+            get_num_heads(self.kvcaches, self.engine_kv_format),
+            self.head_size,
+        )
         lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
+            transfer_tensor,
             kv_cache_pointers,
             slot_mapping[start:end],
             self.device,
@@ -325,7 +500,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             lmc_ops.TransferDirection.H2D,
             self.engine_kv_format,
             block_size=self.block_size,
-            head_size=self.head_size,
+            head_size=_fused_transfer_head_size(self.engine_kv_format, self.head_size),
             skip_prefix_n_tokens=skip_prefix_n_tokens,
         )
 
@@ -362,10 +537,23 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
+        memory_tensor = memory_obj.tensor
+        assert memory_tensor is not None
+        num_heads = get_num_heads(self.kvcaches, self.engine_kv_format)
+        transfer_head_size = _fused_transfer_head_size(
+            self.engine_kv_format, self.head_size
+        )
+        fused_target = None
         with torch.cuda.stream(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+                transfer_tensor = memory_tensor
+                if _is_fused_kv_format(self.engine_kv_format):
+                    fused_target = _allocate_fused_kv_tensor(
+                        memory_tensor, num_heads, self.head_size
+                    )
+                    transfer_tensor = fused_target
                 lmc_ops.multi_layer_kv_transfer(
-                    memory_obj.tensor,
+                    transfer_tensor,
                     kv_cache_pointers,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
@@ -373,14 +561,23 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     lmc_ops.TransferDirection.D2H,
                     self.engine_kv_format,
                     block_size=self.block_size,
-                    head_size=self.head_size,
+                    head_size=transfer_head_size,
                 )
+                if fused_target is not None and fused_target.is_cuda:
+                    _unpack_fused_kv_to_split(
+                        fused_target, memory_tensor, num_heads, self.head_size
+                    )
             else:
                 # kvcaches -> gpu_buffer -> memobj
                 assert self.gpu_buffer.device == self.kvcaches[0].device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+                transfer_tensor = tmp_gpu_buffer
+                if _is_fused_kv_format(self.engine_kv_format):
+                    transfer_tensor = _allocate_fused_kv_tensor(
+                        tmp_gpu_buffer, num_heads, self.head_size
+                    )
                 lmc_ops.multi_layer_kv_transfer(
-                    tmp_gpu_buffer,
+                    transfer_tensor,
                     kv_cache_pointers,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
@@ -388,25 +585,43 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     lmc_ops.TransferDirection.D2H,
                     self.engine_kv_format,
                     block_size=self.block_size,
-                    head_size=self.head_size,
+                    head_size=transfer_head_size,
                 )
-                memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+                if transfer_tensor is not tmp_gpu_buffer:
+                    _unpack_fused_kv_to_split(
+                        transfer_tensor, tmp_gpu_buffer, num_heads, self.head_size
+                    )
+                memory_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if not memory_obj.tensor.is_cuda:
-            # Force a synchronize if the target buffer is NOT CUDA device
-            # NOTE: for better performance, we may not want to sync for every
-            # memory object
+        if not memory_tensor.is_cuda:
+            # Force a synchronize before unpacking a CPU D2H target.
             self.store_stream.synchronize()
+            if fused_target is not None:
+                _unpack_fused_kv_to_split(
+                    fused_target, memory_tensor, num_heads, self.head_size
+                )
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        contains_makv = any(
+            is_makv_quantized_memory_obj(memory_obj) for memory_obj in memory_objs
+        )
+        makv_scope = kwargs.get("makv_timing_scope") if contains_makv else None
+        owns_makv_scope = contains_makv and makv_scope is None
+        if owns_makv_scope:
+            makv_scope = begin_makv_restore_timing_scope()
+        if makv_scope is not None:
+            kwargs = {**kwargs, "makv_timing_scope": makv_scope}
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
-        self.load_stream.synchronize()
+        if not kwargs.get("makv_defer_synchronize", False):
+            self.load_stream.synchronize()
+        if owns_makv_scope:
+            return finish_makv_restore_timing_scope(makv_scope)
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
@@ -531,11 +746,13 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        assert memory_obj.raw_tensor is not None
+        is_makv = is_makv_quantized_memory_obj(memory_obj)
+        if not is_makv:
+            assert memory_obj.raw_tensor is not None
         assert "slot_mapping" in kwargs
-        if self.use_mla:
+        if not is_makv and self.use_mla:
             assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
-        else:
+        elif not is_makv:
             assert memory_obj.metadata.fmt == MemoryFormat.KV_2LTD
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
@@ -551,11 +768,59 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
+        if is_makv:
+            if len(self.group_kv_cache_pointers_on_gpu) != 1:
+                raise RuntimeError(
+                    "MaKV direct restore does not support heterogeneous V3 layer groups"
+                )
+            expected_dtype = getattr(
+                torch,
+                memory_obj.makv_metadata["plan"]["original_dtype"].replace(
+                    "torch.", ""
+                ),
+            )
+            plan_layers = int(memory_obj.makv_metadata["plan"]["num_layers"])
+            if any(
+                get_dtype(self.kvcaches, self.engine_kv_format, layer) != expected_dtype
+                for layer in range(plan_layers)
+            ):
+                raise ValueError("MaKV dtype does not match paged KV cache")
+            restore_makv_quantized_to_paged(
+                memory_obj,
+                device=self.device,
+                page_ptrs=self.group_kv_cache_pointers_on_gpu[0],
+                slot_mapping=slot_mapping[start:end],
+                page_buffer_size=self.page_buffer_size,
+                block_size=self.block_size,
+                head_size=self.head_size,
+                engine_kv_format=self.engine_kv_format,
+                skip_prefix_n_tokens=skip_prefix_n_tokens,
+                require_cuda=bool(kwargs.get("makv_require_cuda_dequant", True)),
+                timing_scope=kwargs.get("makv_timing_scope"),
+            )
+            return
+
+        assert self.metadata.kv_layer_groups_manager is not None
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
             memory_obj_tensor = memory_obj.get_tensor(i)
             assert memory_obj_tensor is not None
-            lmc_ops.multi_layer_kv_transfer(
+            group_layer = self.metadata.kv_layer_groups_manager.kernel_groups[
+                i
+            ].layer_indices[0]
+            group_num_heads = get_num_heads(
+                self.kvcaches, self.engine_kv_format, group_layer
+            )
+            group_head_size = get_head_size(
+                self.kvcaches, self.engine_kv_format, group_layer
+            )
+            transfer_tensor = _pack_split_kv_for_fused_cache(
                 memory_obj_tensor,
+                self.engine_kv_format,
+                group_num_heads,
+                group_head_size,
+            )
+            lmc_ops.multi_layer_kv_transfer(
+                transfer_tensor,
                 kv_cache_pointer,
                 slot_mapping[start:end],
                 self.device,
@@ -563,7 +828,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 lmc_ops.TransferDirection.H2D,
                 self.engine_kv_format,
                 block_size=self.block_size,
-                head_size=self.head_size,
+                head_size=_fused_transfer_head_size(
+                    self.engine_kv_format, group_head_size
+                ),
                 skip_prefix_n_tokens=skip_prefix_n_tokens,
             )
 
@@ -578,6 +845,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
+        assert self.metadata.kv_layer_groups_manager is not None
+        cpu_fused_targets = []
         with torch.cuda.stream(self.store_stream):
             if not self.use_gpu or end - start != self.chunk_size:
                 for i, kv_cache_pointer in enumerate(
@@ -585,8 +854,27 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 ):
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
+                    group_layer = self.metadata.kv_layer_groups_manager.kernel_groups[
+                        i
+                    ].layer_indices[0]
+                    group_num_heads = get_num_heads(
+                        self.kvcaches, self.engine_kv_format, group_layer
+                    )
+                    group_head_size = get_head_size(
+                        self.kvcaches, self.engine_kv_format, group_layer
+                    )
+                    transfer_head_size = _fused_transfer_head_size(
+                        self.engine_kv_format, group_head_size
+                    )
+                    transfer_tensor = memory_obj_tensor
+                    fused_target = None
+                    if _is_fused_kv_format(self.engine_kv_format):
+                        fused_target = _allocate_fused_kv_tensor(
+                            memory_obj_tensor, group_num_heads, group_head_size
+                        )
+                        transfer_tensor = fused_target
                     lmc_ops.multi_layer_kv_transfer(
-                        memory_obj_tensor,
+                        transfer_tensor,
                         kv_cache_pointer,
                         slot_mapping[start:end],
                         self.device,
@@ -594,8 +882,25 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                         lmc_ops.TransferDirection.D2H,
                         self.engine_kv_format,
                         block_size=self.block_size,
-                        head_size=self.head_size,
+                        head_size=transfer_head_size,
                     )
+                    if fused_target is not None:
+                        if fused_target.is_cuda:
+                            _unpack_fused_kv_to_split(
+                                fused_target,
+                                memory_obj_tensor,
+                                group_num_heads,
+                                group_head_size,
+                            )
+                        else:
+                            cpu_fused_targets.append(
+                                (
+                                    fused_target,
+                                    memory_obj_tensor,
+                                    group_num_heads,
+                                    group_head_size,
+                                )
+                            )
             else:
                 # kvcaches -> gpu_buffer -> memobj
                 assert self.group_tmp_buffer is not None
@@ -603,8 +908,25 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     self.group_kv_cache_pointers_on_gpu
                 ):
                     tmp_gpu_buffer = self.group_tmp_buffer[i][:, :, : end - start, :]
+                    group_layer = self.metadata.kv_layer_groups_manager.kernel_groups[
+                        i
+                    ].layer_indices[0]
+                    group_num_heads = get_num_heads(
+                        self.kvcaches, self.engine_kv_format, group_layer
+                    )
+                    group_head_size = get_head_size(
+                        self.kvcaches, self.engine_kv_format, group_layer
+                    )
+                    transfer_head_size = _fused_transfer_head_size(
+                        self.engine_kv_format, group_head_size
+                    )
+                    transfer_tensor = tmp_gpu_buffer
+                    if _is_fused_kv_format(self.engine_kv_format):
+                        transfer_tensor = _allocate_fused_kv_tensor(
+                            tmp_gpu_buffer, group_num_heads, group_head_size
+                        )
                     lmc_ops.multi_layer_kv_transfer(
-                        tmp_gpu_buffer,
+                        transfer_tensor,
                         kv_cache_pointer,
                         slot_mapping[start:end],
                         self.device,
@@ -612,8 +934,15 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                         lmc_ops.TransferDirection.D2H,
                         self.engine_kv_format,
                         block_size=self.block_size,
-                        head_size=self.head_size,
+                        head_size=transfer_head_size,
                     )
+                    if transfer_tensor is not tmp_gpu_buffer:
+                        _unpack_fused_kv_to_split(
+                            transfer_tensor,
+                            tmp_gpu_buffer,
+                            group_num_heads,
+                            group_head_size,
+                        )
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
                     memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
@@ -623,15 +952,36 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             # NOTE: for better performance, we may not want to sync for every
             # memory object
             self.store_stream.synchronize()
+            for (
+                fused_target,
+                split_target,
+                group_num_heads,
+                group_head_size,
+            ) in cpu_fused_targets:
+                _unpack_fused_kv_to_split(
+                    fused_target, split_target, group_num_heads, group_head_size
+                )
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        contains_makv = any(
+            is_makv_quantized_memory_obj(memory_obj) for memory_obj in memory_objs
+        )
+        makv_scope = kwargs.get("makv_timing_scope") if contains_makv else None
+        owns_makv_scope = contains_makv and makv_scope is None
+        if owns_makv_scope:
+            makv_scope = begin_makv_restore_timing_scope()
+        if makv_scope is not None:
+            kwargs = {**kwargs, "makv_timing_scope": makv_scope}
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
-        self.load_stream.synchronize()
+        if not kwargs.get("makv_defer_synchronize", False):
+            self.load_stream.synchronize()
+        if owns_makv_scope:
+            return finish_makv_restore_timing_scope(makv_scope)
 
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
