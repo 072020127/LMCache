@@ -74,16 +74,16 @@ def finish_makv_restore_timing_scope(scope_id: int):
     return module.finish_makv_restore_timing_scope(scope_id)
 _FUSED_KV_FORMATS = frozenset(
     {
-        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
-        lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS,
-        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_CS,
-        lmc_ops.EngineKVFormat.NL_X_NB_BS_NH_CS,
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS,
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
     }
 )
 _HND_FUSED_KV_FORMATS = frozenset(
     {
-        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
-        lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_CS,
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS,
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
     }
 )
 
@@ -500,7 +500,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 get_num_heads(self.kvcaches, self.engine_kv_format),
                 self.head_size,
             )
-            lmc_ops.multi_layer_kv_transfer(
+            device_ops.multi_layer_kv_transfer(
                 transfer_tensor,
                 kv_cache_pointers,
                 slot_mapping[start:end],
@@ -577,7 +577,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                         memory_tensor, num_heads, self.head_size
                     )
                     transfer_tensor = fused_target
-                    lmc_ops.multi_layer_kv_transfer(
+                    device_ops.multi_layer_kv_transfer(
                         transfer_tensor,
                         kv_cache_pointers,
                         slot_mapping[start:end],
@@ -613,7 +613,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     transfer_tensor = _allocate_fused_kv_tensor(
                         tmp_gpu_buffer, num_heads, self.head_size
                     )
-                    lmc_ops.multi_layer_kv_transfer(
+                    device_ops.multi_layer_kv_transfer(
                         transfer_tensor,
                         kv_cache_pointers,
                         slot_mapping[start:end],
@@ -875,7 +875,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 group_head_size,
             )
             if _is_fused_kv_format(self.engine_kv_format):
-                lmc_ops.multi_layer_kv_transfer(
+                device_ops.multi_layer_kv_transfer(
                     transfer_tensor,
                     kv_cache_pointer,
                     slot_mapping[start:end],
@@ -944,7 +944,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                         )
                         transfer_tensor = fused_target
                     if _is_fused_kv_format(self.engine_kv_format):
-                        lmc_ops.multi_layer_kv_transfer(
+                        device_ops.multi_layer_kv_transfer(
                             transfer_tensor,
                             kv_cache_pointer,
                             slot_mapping[start:end],
@@ -1010,7 +1010,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                             tmp_gpu_buffer, group_num_heads, group_head_size
                         )
                     if _is_fused_kv_format(self.engine_kv_format):
-                        lmc_ops.multi_layer_kv_transfer(
+                        device_ops.multi_layer_kv_transfer(
                             transfer_tensor,
                             kv_cache_pointer,
                             slot_mapping[start:end],
